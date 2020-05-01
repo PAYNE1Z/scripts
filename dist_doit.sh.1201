@@ -1,0 +1,232 @@
+#!/bin/bash
+
+#---------------------------------------------------------------#
+# ScriptsName: dist_doit.sh                                     #
+# ScriptsPath:/root/scripts/dist_doit.sh                        #
+# Purpose: vhost distribute customer file                       #
+# Edition: 1.0                                                  #
+# CreateDate:2016-09-04 13:31                                   #
+# Author: Payne Zheng <zzuai520@live.com>                       #
+#---------------------------------------------------------------#
+
+# Get source file to local
+# -b background operation 
+# --output-file=${wget_log} output to the specified file
+# --max-redirect=0 maximum allowed redirection (disable redirection)
+# --tries=1 maximum retry (default 20)
+# --limit-rate=20m speed limit
+# First take data from the upnode,  if you fail find the source station to take
+
+tailFile() {
+    local lock=$1 wget_log=$2
+    if [ -f ${wget_log} ]; then
+        tail -F -n5 --pid $(cat $lock) ${wget_log}
+        exit
+    else
+        sleep 0.5
+        tailFile "$lock" "${wget_log}"
+    fi
+}
+
+wgetOne() {
+    local url="$1" pnode=$2 wget_log=$3 download_dir=$4
+    local wget3=/usr/bin/wget3
+    $wget3 --header='Accept-Encoding:gzip, deflate, sdch' --max-redirect=0 \
+    --progress=% -P ${download_dir} --tries=2 --timeout=30 -np -c -r \
+    --limit-rate=20m "$url" -e http-proxy=$pnode:80
+}
+
+wgetSlice() {
+    local user=$1 url="$2" pnode=$3 wget_log=$4 download_dir=$5 tempDownFile="$6"
+    local wget3=/usr/bin/wget3 size=$7
+    $wget3 --header='Accept-Encoding:gzip, deflate, sdch' --max-redirect=0 \
+    --progress=%:$size -c -O ${download_dir}/"${tempDownFile}"  --tries=2 --timeout=30 \
+    --limit-rate=20m "$url" -e http-proxy=$pnode:80
+}
+
+# Check downfile size
+checkDown() {
+    local wget_log=$1 url="$2" downFile=$3
+    downSize=$(du -b "/data/vhost/${downFile}" | awk '{print $1}')
+    if [ "$downSize" = "$size" ]; then
+        echo -e "== CHECK WGET DONE ==\n100%" | tee -a ${wget_log}
+        return 0
+    else
+        echo -e " == DOWNLOAD ERROR ==\n0%" | tee -a ${wget_log}
+        rm -rf "/data/vhost/${downFile}" && exit 1
+        return 1
+    fi
+}
+
+# Load local downfile to nginx cache
+loadCahce() {
+    local url="$1" loadurl=${url/vhost\//}
+    ngctool "rmf=$loadurl" &>/dev/null
+    curl -I -H "VHOST: vhost" "$loadurl" -x 127.0.0.1:80 2>/dev/null
+}
+ 
+# Check whether the local cache is consistent with the source station       
+checkMd5() {
+    local url="$1" sETag=$2 loadurl=${url/vhost\//}
+    nodeETag=$(curl -I -H "VHOST: vhost" "$loadurl" -x 127.0.0.1:80 2>/dev/null | awk -F '"' '/ETag/{print $2}')
+    echo -e "ORGETAG: == $sETag ==\nNODETAG: == $nodeETag ==" | tee -a ${wget_log}
+    test "$sETag" = "$nodeETag" && return 0 || return 1
+}
+
+
+# Get script pid
+sPID=$$
+
+# Defined variables
+user=$1
+id=$2
+ip=$3
+url=$4
+size=$5
+pnode=$6
+sETag=$7
+snode=$8
+mode=$9
+level=${10}
+download_dir=/data/vhost
+log_path=/tmp/distribute/$user/$id
+log_file=${log_path}/dist.log
+wget_log=${log_path}/wget.log
+test -d ${log_path} || mkdir -p ${log_path}
+lock=$log_path/lock
+gnode=113.113.97.227
+filePath=${url##*://}
+Path=${filePath%/*}
+test -d ${download_dir}/${Path/vhost\//} || mkdir -p ${download_dir}/${Path/vhost\//}
+File=${filePath##*/}
+tempFile=${Path}/.tmp.${File}
+tempDownFile=${tempFile/vhost\//}
+vhostUrl="http://${tempFile}"
+localFile=${url##*://}
+downFile=${localFile/vhost\//}
+tempSizeFile=/tmp/distribute/size.txt
+
+echo "$*" >> /tmp/distribute/access.log
+# 在远程连接过来时为了此脚本能在后台运行，并且返回脚本运行时的输出到远程机上，
+# 在连接是会连续运行两次此脚本，第一次带全参数，会加锁运行脚本，第二次带两个参数来运行脚本，
+# 如果是两个参数那么就直接tail日志文件返回到远程机上
+# tail结束后退出脚本
+if [ $# -eq 2 ]; then
+    pid=$!
+    while :
+    do
+        test -f ${wget_log} || { sleep 0.2 && continue; }
+        tail -F -n3 --pid $pid ${wget_log}
+        exit
+    done 
+fi
+
+# 当客户是以边上传边分发的方式进行文件的上传与分发
+# 那么在脚本运行完毕，所有节点都已返回结果之后，后台程序再次调用分发脚本，传递delete标记参数
+# 分发脚本会再传递4个参数调用此脚本进行节点续传临时文件的清理
+# 在清理完后退出脚本
+if [ $# -eq 4 ]; then
+    rm -f "${download_dir}/${downFile}"
+    rm -f "${download_dir}/${tempDownFile}"
+    if [ ! -f "${download_dir}/${downFile}" -a ! -f "${download_dir}/${tempDownFile}" ]; then
+        echo -e "TEMPORARY FILE:\n${downFile}\n${tempDownFile}\nDELETED OK\n100%" | tee -a ${wget_log}
+    fi
+    exit
+fi
+
+
+# Lock before start 
+{
+    flock -xn 33 || tailFile "$lock" "${wget_log}"
+        echo "$sPID" > $lock
+        loadurl=${url/vhost\//} 
+        oldETag=$(ngctool -h "ls=$loadurl" 2>/dev/null | grep ETag | cut -d '"' -f 2)
+        test "$oldETag" == "$sETag" && { echo -e "=== CACHE EXISTS; NOTHING TO DO ===\n100%" | tee -a ${wget_log} && exit; }
+        
+        test "$pnode" = "114.119.10.168" && pnode="183.232.150.5"
+        test "$pnode" = "114.119.10.169" && pnode="183.232.150.4"
+	    
+        if [ "$mode" = 2 ]; then  # mode=2 边传边发
+	        i=0
+            n=0
+            b=0
+            ln -sf "${download_dir}/${tempDownFile}" "${download_dir}/${downFile}"
+	        while :
+	        do
+            wgetSlice "$user" "$vhostUrl" "$pnode" "$wget_log" "$download_dir" "$tempDownFile" "$size"
+		    sta=$?
+		    if [ "$sta" = "56" -o "$sta" = "166" -o "$sta" = "0" -o "$sta" = "102" ]; then
+                read lastSize < "$tempSizeFile"
+    		    downSize=$(du -b "${download_dir}/${tempDownFile}" | awk '{print $1}')
+                test -z $lastSize && lastSize=$downSize
+                if [ "$lastSize" -eq "$downSize" ]; then
+                    let b++
+                else
+                    b=0
+                    echo $downsize > $tempSizeFile
+                fi
+			    if [ "$downSize" = "$size" ]; then
+                    echo -e "ORGSIZE:  $size\nDOWNSIZE: $downSize\nSLICE WGET DOWN\n100%"
+                    break
+                else
+                    if [ $b -eq 360 ]; then
+                        echo "==> SOURCE FILE ERROR"
+                        rm -rf "${download_dir}/${tempDownFile}" "${download_dir}/${downFile}"
+                        exit
+                    fi
+			        sleep 5 && continue
+                fi
+	    	elif [ "$sta" = "154" -o "$sta" = "4" -o "$sta" -gt "200" ]; then
+                if [ $sta -eq 154 ]; then
+                    let i++
+                    test $level -eq 1 && vhostUrl="http://${localFile}"
+                    test $i -eq 10 && { pnode=$snode && vhostUrl="http://${downFile}"; }
+                    test $i -eq 20 && { pnode=$gnode && vhostUrl="http://vhost/${tempDownFile}"; }
+                    if [ $i -eq 360 ]; then
+                        echo "==> SOURCE FILE DOES NOT EXIST"
+                        rm -rf "${download_dir}/${tempDownFile}" "${download_dir}/${downFile}"
+                        exit
+                    fi
+                    sleep 5 && continue
+                fi
+			    let i++
+			    test $i -eq 1 && { pnode=$gnode && vhostUrl="http://vhost/${tempDownFile}"; }
+			    test $i -eq 2 && { pnode=$snode && vhostUrl="http://${downFile}"; }
+			    test $i -ge 3 && break
+			    continue
+		    fi
+	        done 2>&1 | tee ${wget_log}
+        
+	    elif [ "$mode" = 1 ]; then # mode=1 普通分发(上传完再分发)
+            z=0
+            while :
+            do  
+                let z++
+                wgetOne "$url" "$pnode" "$wget_log" "$download_dir"
+                sta=$?
+                test $sta -eq 102 -o $sta -eq 154 && continue
+                if [ $sta -gt 200 ]; then
+                    test $z -eq 1 && pnode="$snode" && continue
+                    test $z -eq 2 && pnode="$gnode" && continue
+                fi
+                checkDown "$wget_log" "$url" "$downFile"
+                test $? -eq 0 && break
+            done 2>&1 | tee ${wget_log}
+        fi
+
+        loadCahce "$url"
+        checkMd5 "$url" "$sETag"
+        if [ $? -eq 0 ]; then
+            echo -e "$ip $url : \n== CACHED OK ==\n100%" | tee -a ${wget_log}
+            test $mode -eq 1 && rm -f "${download_dir}/${localFile}" || exit
+            test ! -f "${download_dir}/${localFile}" && \
+            echo -e "VHOSTFILE:DELETED\n${download_dir}/${localFile}\n100%" | tee -a ${wget_log}
+        else
+            echo -e "$ip $url : \n== Check ETag Failed ==\n0%" | tee -a ${wget_log}
+            rm -f "${download_dir}/${downFile}"
+            rm -f "${download_dir}/${tempDownFile}"
+            ngctool "rmf=$url" &>/dev/null
+            /usr/bin/wget3 -O /dev/null  --header='Accept-Encoding:gzip, deflate, sdch' --max-redirect=0 \
+            --progress=% ${url/vhost\//} -e http-proxy=127.0.0.1:80 2>&1 | tee -a ${wget_log}
+        fi
+} 33>> $lock
